@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <vector>
 
 #if defined(_WIN32)
 #   define WIN32_LEAN_AND_MEAN
@@ -45,6 +46,17 @@ namespace ultramodern {
             unsigned int VI_Y_SCALE_REG;
         };
         ViRegs* get_vi_regs();
+
+        struct VIBufferSnapshot {
+            uint32_t address = 0;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint8_t siz = 0;
+            uint64_t sequence = 0;
+            std::vector<uint8_t> bytes;
+        };
+
+        bool copy_vi_buffer_snapshot(uint32_t address, VIBufferSnapshot &out);
 
 #if defined(_WIN32)
         // Native HWND handle to the target window.

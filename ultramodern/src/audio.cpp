@@ -35,10 +35,8 @@ void ultramodern::queue_audio_buffer(RDRAM_ARG PTR(int16_t) audio_data_, uint32_
     }
 }
 
-// For SDL2
-//uint32_t buffer_offset_frames = 1;
-// For Godot
-float buffer_offset_frames = 0.5f;
+// The platform callback already applies any timing margin when it reports buffered frames.
+constexpr float buffer_offset_frames = 0.0f;
 
 // If there's ever any audio popping, check here first. Some games are very sensitive to
 // the remaining sample count and reporting a number that's too high here can lead to issues.

@@ -1,11 +1,13 @@
 #include <thread>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cinttypes>
 #include <variant>
 #include <unordered_map>
 #include <utility>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <cstring>
 
@@ -17,6 +19,13 @@
 
 #include "ultramodern/rsp.hpp"
 #include "ultramodern/renderer_context.hpp"
+
+#if defined(__ANDROID__) && defined(BANJO_ENABLE_ANDROID_TRACE_LOGS)
+#include <android/log.h>
+#define BANJO_ANDROID_RENDER_LOG(...) __android_log_print(ANDROID_LOG_INFO, "BanjoRender", __VA_ARGS__)
+#else
+#define BANJO_ANDROID_RENDER_LOG(...) ((void)0)
+#endif
 
 static ultramodern::events::callbacks_t events_callbacks{};
 
@@ -141,6 +150,102 @@ ultramodern::renderer::ViRegs* ultramodern::renderer::get_vi_regs() {
     return &events_context.vi.update_screen_regs;
 }
 
+#ifdef __ANDROID__
+static constexpr size_t kAndroidViSnapshotCount = 4;
+static std::mutex android_vi_snapshot_mutex;
+static std::array<ultramodern::renderer::VIBufferSnapshot, kAndroidViSnapshotCount> android_vi_snapshots{};
+static uint64_t android_vi_snapshot_sequence = 0;
+static std::atomic_uint32_t screen_update_order_log_count = 0;
+
+static bool should_queue_android_post_update_screen(const ViState &next_state, int field, uint32_t &origin_out, uint32_t &width_out) {
+    origin_out = 0;
+    width_out = 0;
+    if (!ultramodern::is_game_started() || (next_state.mode == nullptr) || (next_state.state & VI_STATE_BLACK)) {
+        return false;
+    }
+
+    const OSViCommonRegs *common_regs = &next_state.mode->comRegs;
+    const OSViFieldRegs *field_regs = &next_state.mode->fldRegs[field];
+    const uint32_t framebuffer = osVirtualToPhysical(next_state.framebuffer);
+    uint32_t origin = framebuffer + field_regs->origin;
+    if (next_state.state & VI_STATE_REPEATLINE) {
+        origin = framebuffer;
+    }
+
+    origin_out = origin;
+    width_out = common_regs->width;
+    return (width_out != 320U) && (origin_out != 0U) && (origin_out < 0x00600000U);
+}
+
+static void store_android_vi_snapshot(uint32_t address, uint32_t width, uint32_t height, uint8_t siz, uint32_t origin_offset) {
+    constexpr uint32_t kAndroidSnapshotRdramSize = 0x00800000U;
+    if ((events_context.rdram == nullptr) || (address >= kAndroidSnapshotRdramSize) || (width == 0) || (height == 0) || (siz < 2U)) {
+        return;
+    }
+
+    const uint32_t bytes_per_pixel = 1U << (siz - 1U);
+    const uint64_t capture_bytes_u64 = uint64_t(origin_offset) + (uint64_t(width) * uint64_t(height) * uint64_t(bytes_per_pixel));
+    if (capture_bytes_u64 == 0) {
+        return;
+    }
+
+    const uint32_t capture_bytes = uint32_t(std::min<uint64_t>(capture_bytes_u64, uint64_t(kAndroidSnapshotRdramSize - address)));
+    if (capture_bytes == 0) {
+        return;
+    }
+
+    std::scoped_lock lock(android_vi_snapshot_mutex);
+    ultramodern::renderer::VIBufferSnapshot *slot = nullptr;
+    for (auto &candidate : android_vi_snapshots) {
+        if (candidate.address == address) {
+            slot = &candidate;
+            break;
+        }
+    }
+
+    if (slot == nullptr) {
+        slot = &android_vi_snapshots[0];
+        for (auto &candidate : android_vi_snapshots) {
+            if (candidate.sequence < slot->sequence) {
+                slot = &candidate;
+            }
+        }
+    }
+
+    slot->address = address;
+    slot->width = width;
+    slot->height = height;
+    slot->siz = siz;
+    slot->sequence = ++android_vi_snapshot_sequence;
+    slot->bytes.resize(capture_bytes);
+    std::memcpy(slot->bytes.data(), events_context.rdram + address, capture_bytes);
+}
+#endif
+
+bool ultramodern::renderer::copy_vi_buffer_snapshot(uint32_t address, ultramodern::renderer::VIBufferSnapshot &out) {
+#ifdef __ANDROID__
+    std::scoped_lock lock(android_vi_snapshot_mutex);
+    const ultramodern::renderer::VIBufferSnapshot *best = nullptr;
+    for (const auto &candidate : android_vi_snapshots) {
+        if ((candidate.address == address) && !candidate.bytes.empty()) {
+            if ((best == nullptr) || (candidate.sequence > best->sequence)) {
+                best = &candidate;
+            }
+        }
+    }
+
+    if (best != nullptr) {
+        out = *best;
+        return true;
+    }
+#else
+    (void)address;
+    (void)out;
+#endif
+
+    return false;
+}
+
 extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_, OSMesg msg) {
     std::lock_guard lock{ events_context.message_mutex };
 
@@ -222,12 +327,32 @@ void vi_thread_func() {
             events_context.action_queue.enqueue(DummyWorkloadAction{events_context.vi.get_next_state()->framebuffer});
         }
 
-        // Queue a screen update for the graphics thread with the current VI register state.
-        // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
-        events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
+        const ultramodern::renderer::ViRegs previous_vi_regs = events_context.vi.regs;
+#if defined(__ANDROID__)
+        uint32_t next_vi_origin = 0;
+        uint32_t next_vi_width = 0;
+        const bool queue_post_update_screen = should_queue_android_post_update_screen(*events_context.vi.get_next_state(), events_context.vi.field, next_vi_origin, next_vi_width);
+        if (!queue_post_update_screen) {
+#endif
+            // Queue a screen update for the graphics thread with the current VI register state.
+            // Doing this before the VI update is equivalent to updating the screen after the previous frame's scanout finished.
+            events_context.action_queue.enqueue(ScreenUpdateAction{ previous_vi_regs });
+#if defined(__ANDROID__)
+        }
+#endif
 
         // Update VI registers and swap VI modes.
         events_context.vi.update_vi();
+
+#if defined(__ANDROID__)
+        if (queue_post_update_screen) {
+            events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
+            if (screen_update_order_log_count.fetch_add(1) < 32U) {
+                BANJO_ANDROID_RENDER_LOG("ScreenUpdate queued post-VI prevOrigin=0x%08" PRIX32 " prevWidth=%" PRIu32 " nextOrigin=0x%08" PRIX32 " nextWidth=%" PRIu32,
+                    previous_vi_regs.VI_ORIGIN_REG, previous_vi_regs.VI_WIDTH_REG, next_vi_origin, next_vi_width);
+            }
+        }
+#endif
 
         // If the game has started, handle sending VI and AI events.
         if (ultramodern::is_game_started()) {
@@ -296,8 +421,150 @@ void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_r
 std::atomic_uint32_t display_refresh_rate = 60;
 std::atomic<float> resolution_scale = 1.0f;
 
+#ifdef __ANDROID__
+static std::atomic_uint32_t sp_task_log_count = 0;
+static std::atomic_uint32_t screen_update_log_count = 0;
+static std::atomic_uint32_t vi_swap_log_count = 0;
+static std::atomic_uint32_t vi_black_log_count = 0;
+
+static bool should_log_android_render_event(std::atomic_uint32_t& counter) {
+    uint32_t count = counter.fetch_add(1);
+    return (count < 48) || ((count < 240) && ((count % 30U) == 0U));
+}
+
+static constexpr uint32_t kBanjoRdramBase = 0x80000000U;
+static constexpr uint32_t kBanjoRdramSize = 0x00800000U;
+static constexpr uint32_t kBanjoMainLoopStateAddr = 0x8027A130U;
+static constexpr uint32_t kBanjoFramebufferWidthAddr = 0x80276588U;
+static constexpr uint32_t kBanjoFramebufferHeightAddr = 0x8027658CU;
+static constexpr uint32_t kBanjoBootMapAddr = 0x8027BEE8U;
+static constexpr uint32_t kBanjoGameStateAddr = 0x8037E8E0U;
+static constexpr uint32_t kBanjoTransitionStateAddr = 0x80382430U;
+static constexpr uint32_t kBanjoLevelStateAddr = 0x80383300U;
+static constexpr uint32_t kBanjoMapStateAddr = 0x803835D0U;
+
+struct BanjoBootState {
+    uint32_t main_loop_state = 0;
+    uint32_t framebuffer_width = 0;
+    uint32_t framebuffer_height = 0;
+    uint32_t boot_map = 0;
+    uint8_t current_level = 0;
+    uint32_t current_map_state = 0;
+    uint32_t current_map = 0;
+    uint32_t current_exit = 0;
+    uint32_t game_loop_counter = 0;
+    uint32_t game_mode = 0;
+    uint32_t freeze_scene = 0;
+    uint8_t transition = 0;
+    uint8_t map = 0;
+    uint8_t exit = 0;
+    uint8_t reset_on_load = 0;
+    uint8_t unk18 = 0;
+    uint8_t unk19 = 0;
+    uint8_t pending_mode = 0;
+    uint8_t pending_mode_arg = 0;
+    uint8_t unk1c = 0;
+    uint32_t transition_counter = 0;
+    uint8_t transition_state = 0;
+    float transition_timer = 0.0f;
+};
+
+struct AndroidFramebufferSample {
+    uint32_t mean_byte = 0;
+    uint32_t nonzero_samples = 0;
+    uint32_t total_samples = 0;
+};
+
+static bool read_android_rdram_bytes(uint32_t address, void* out, size_t size) {
+    if ((events_context.rdram == nullptr) || (address < kBanjoRdramBase)) {
+        return false;
+    }
+
+    uint32_t offset = address - kBanjoRdramBase;
+    if (offset > (kBanjoRdramSize - size)) {
+        return false;
+    }
+
+    std::memcpy(out, events_context.rdram + offset, size);
+    return true;
+}
+
+static bool read_android_rdram_u32(uint32_t address, uint32_t& out) {
+    return read_android_rdram_bytes(address, &out, sizeof(out));
+}
+
+static bool read_android_rdram_u8(uint32_t address, uint8_t& out) {
+    return read_android_rdram_bytes(address, &out, sizeof(out));
+}
+
+static bool read_android_rdram_f32(uint32_t address, float& out) {
+    return read_android_rdram_bytes(address, &out, sizeof(out));
+}
+
+static bool read_banjo_boot_state(BanjoBootState& state) {
+    return read_android_rdram_u32(kBanjoMainLoopStateAddr, state.main_loop_state)
+        && read_android_rdram_u32(kBanjoFramebufferWidthAddr, state.framebuffer_width)
+        && read_android_rdram_u32(kBanjoFramebufferHeightAddr, state.framebuffer_height)
+        && read_android_rdram_u32(kBanjoBootMapAddr, state.boot_map)
+        && read_android_rdram_u8(kBanjoLevelStateAddr + 0x01U, state.current_level)
+        && read_android_rdram_u32(kBanjoMapStateAddr + 0x00U, state.current_map_state)
+        && read_android_rdram_u32(kBanjoMapStateAddr + 0x04U, state.current_map)
+        && read_android_rdram_u32(kBanjoMapStateAddr + 0x08U, state.current_exit)
+        && read_android_rdram_u32(kBanjoGameStateAddr + 0x00U, state.game_loop_counter)
+        && read_android_rdram_u32(kBanjoGameStateAddr + 0x04U, state.game_mode)
+        && read_android_rdram_u32(kBanjoGameStateAddr + 0x0CU, state.freeze_scene)
+        && read_android_rdram_u8(kBanjoGameStateAddr + 0x14U, state.transition)
+        && read_android_rdram_u8(kBanjoGameStateAddr + 0x15U, state.map)
+        && read_android_rdram_u8(kBanjoGameStateAddr + 0x16U, state.exit)
+        && read_android_rdram_u8(kBanjoGameStateAddr + 0x17U, state.reset_on_load)
+        && read_android_rdram_u8(kBanjoGameStateAddr + 0x18U, state.unk18)
+        && read_android_rdram_u8(kBanjoGameStateAddr + 0x19U, state.unk19)
+        && read_android_rdram_u8(kBanjoGameStateAddr + 0x1AU, state.pending_mode)
+        && read_android_rdram_u8(kBanjoGameStateAddr + 0x1BU, state.pending_mode_arg)
+        && read_android_rdram_u8(kBanjoGameStateAddr + 0x1CU, state.unk1c)
+        && read_android_rdram_u32(kBanjoTransitionStateAddr + 0x00U, state.transition_counter)
+        && read_android_rdram_u8(kBanjoTransitionStateAddr + 0x08U, state.transition_state)
+        && read_android_rdram_f32(kBanjoTransitionStateAddr + 0x14U, state.transition_timer);
+}
+
+static bool transition_blocks_render(const BanjoBootState& state) {
+    return (state.transition_state == 3U)
+        || (state.transition_state == 5U)
+        || (state.transition_state == 8U)
+        || (((state.transition_state == 1U) || (state.transition_state == 6U)) && (state.transition_counter < 2U));
+}
+
+static AndroidFramebufferSample sample_android_framebuffer_bytes(uint32_t phys, uint32_t frame_bytes) {
+    AndroidFramebufferSample sample{};
+    if ((events_context.rdram == nullptr) || (phys >= kBanjoRdramSize)) {
+        return sample;
+    }
+
+    frame_bytes = std::min(frame_bytes, kBanjoRdramSize - phys);
+    if (frame_bytes == 0) {
+        return sample;
+    }
+
+    uint32_t sample_count = std::min<uint32_t>(256U, frame_bytes);
+    uint32_t sample_step = std::max(frame_bytes / sample_count, 1U);
+    uint64_t byte_sum = 0;
+    for (uint32_t offset = 0; offset < frame_bytes; offset += sample_step) {
+        uint8_t value = events_context.rdram[phys + offset];
+        byte_sum += value;
+        sample.nonzero_samples += (value != 0);
+        sample.total_samples++;
+    }
+
+    if (sample.total_samples > 0) {
+        sample.mean_byte = uint32_t(byte_sum / sample.total_samples);
+    }
+
+    return sample;
+}
+#endif
+
 uint32_t ultramodern::get_target_framerate(uint32_t original) {
-    auto& config = ultramodern::renderer::get_graphics_config();
+    auto config = ultramodern::renderer::get_graphics_config();
 
     switch (config.rr_option) {
         case ultramodern::renderer::RefreshRate::Original:
@@ -334,7 +601,8 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
 
     auto old_config = ultramodern::renderer::get_graphics_config();
 
-    auto renderer_context = ultramodern::renderer::create_render_context(rdram, window_handle, ultramodern::renderer::get_graphics_config().developer_mode);
+    auto create_config = ultramodern::renderer::get_graphics_config();
+    auto renderer_context = ultramodern::renderer::create_render_context(rdram, window_handle, create_config.developer_mode);
 
     renderer_chosen_api.store(renderer_context->get_chosen_api());
     if (!renderer_context->valid()) {
@@ -353,10 +621,22 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
     // Notify the caller thread that this thread is ready.
     thread_ready->signal();
 
+    std::optional<Action> deferred_action;
+
     while (!exited) {
         // Try to pull an action from the queue
         Action action;
-        if (events_context.action_queue.wait_dequeue_timed(action, 1ms)) {
+        bool has_action = false;
+        if (deferred_action.has_value()) {
+            action = std::move(*deferred_action);
+            deferred_action.reset();
+            has_action = true;
+        }
+        else {
+            has_action = events_context.action_queue.wait_dequeue_timed(action, 1ms);
+        }
+
+        if (has_action) {
             // Determine the action type and act on it
             if (const auto* task_action = std::get_if<SpTaskAction>(&action)) {
                 // Tell the game that the RSP completed instantly. This will allow it to queue other task types, but it won't
@@ -369,9 +649,23 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 PTR(u64) displaylist = task_action->task.t.data_ptr;
                 ultramodern::extensions::on_displaylist_submitted(displaylist);
 
+#ifdef __ANDROID__
+                const bool log_sp_task = should_log_android_render_event(sp_task_log_count);
+                if (log_sp_task) {
+                    BANJO_ANDROID_RENDER_LOG("SpTask begin dl=0x%08" PRIX32 " ucode=0x%08" PRIX32,
+                        uint32_t(task_action->task.t.data_ptr), uint32_t(task_action->task.t.ucode));
+                }
+#endif
+
                 [[maybe_unused]] auto renderer_start = std::chrono::high_resolution_clock::now();
                 renderer_context->send_dl(&task_action->task);
                 [[maybe_unused]] auto renderer_end = std::chrono::high_resolution_clock::now();
+
+#ifdef __ANDROID__
+                if (log_sp_task) {
+                    BANJO_ANDROID_RENDER_LOG("SpTask end dl=0x%08" PRIX32, uint32_t(task_action->task.t.data_ptr));
+                }
+#endif
 
                 dp_complete();
                 // TODO hook the parsed event up to the actual parsing point when a callback is added to RT64.
@@ -380,10 +674,43 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
             }
             else if (const auto* screen_update_action = std::get_if<ScreenUpdateAction>(&action)) {
-                events_context.vi.update_screen_regs = screen_update_action->regs;
+                ScreenUpdateAction coalesced_screen_update = *screen_update_action;
+#ifdef __ANDROID__
+                Action queued_action;
+                while (events_context.action_queue.try_dequeue(queued_action)) {
+                    if (const auto* next_screen_update = std::get_if<ScreenUpdateAction>(&queued_action)) {
+                        coalesced_screen_update = *next_screen_update;
+                    }
+                    else {
+                        deferred_action = std::move(queued_action);
+                        break;
+                    }
+                }
+#endif
+#ifdef __ANDROID__
+                const bool log_screen_update = should_log_android_render_event(screen_update_log_count);
+                if (log_screen_update) {
+                    uint32_t origin = coalesced_screen_update.regs.VI_ORIGIN_REG;
+                    uint32_t width = coalesced_screen_update.regs.VI_WIDTH_REG;
+                    uint32_t type = coalesced_screen_update.regs.VI_STATUS_REG & 0x3U;
+                    uint32_t bytes_per_pixel = (type == 3U) ? 4U : 2U;
+                    AndroidFramebufferSample sample = sample_android_framebuffer_bytes(origin, width * 240U * bytes_per_pixel);
+                    BANJO_ANDROID_RENDER_LOG("ScreenUpdate begin origin=0x%08" PRIX32 " width=%" PRIu32 " status=0x%08" PRIX32,
+                        origin, width, coalesced_screen_update.regs.VI_STATUS_REG);
+                    BANJO_ANDROID_RENDER_LOG("ScreenUpdate sample origin=0x%08" PRIX32 " meanByte=%" PRIu32 " nonzero=%" PRIu32 "/%" PRIu32,
+                        origin, sample.mean_byte, sample.nonzero_samples, sample.total_samples);
+                }
+#endif
+                events_context.vi.update_screen_regs = coalesced_screen_update.regs;
                 renderer_context->update_screen();
                 display_refresh_rate = renderer_context->get_display_framerate();
                 resolution_scale = renderer_context->get_resolution_scale();
+#ifdef __ANDROID__
+                if (log_screen_update) {
+                    BANJO_ANDROID_RENDER_LOG("ScreenUpdate end rate=%" PRIu32 " scale=%.2f",
+                        display_refresh_rate.load(), resolution_scale.load());
+                }
+#endif
             }
             else if (const auto* config_action = std::get_if<UpdateConfigAction>(&action)) {
                 (void)config_action;
@@ -456,7 +783,54 @@ void set_dummy_vi(bool odd) {
 
 extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
     std::lock_guard lock{ events_context.message_mutex };
-    events_context.vi.get_next_state()->framebuffer = frameBufPtr;
+    ViState* next_state = events_context.vi.get_next_state();
+    next_state->framebuffer = frameBufPtr;
+#ifdef __ANDROID__
+    uint32_t phys = osVirtualToPhysical(frameBufPtr);
+    uint32_t width = (next_state->mode != nullptr) ? next_state->mode->comRegs.width : 320U;
+    uint32_t type = next_state->control & 0x3U;
+    uint32_t bytes_per_pixel = (type == 3U) ? 4U : 2U;
+    uint32_t frame_bytes = width * 240U * bytes_per_pixel;
+    AndroidFramebufferSample sample = sample_android_framebuffer_bytes(phys, frame_bytes);
+
+    BanjoBootState boot_state{};
+    const bool has_boot_state = read_banjo_boot_state(boot_state);
+    const uint32_t snapshot_height = has_boot_state ? std::max<uint32_t>(boot_state.framebuffer_height, 1U) : 240U;
+    uint32_t origin_offset = 0;
+    if (next_state->mode != nullptr) {
+        origin_offset = next_state->mode->fldRegs[events_context.vi.field].origin;
+        if (next_state->state & VI_STATE_REPEATLINE) {
+            origin_offset = 0;
+        }
+    }
+
+    const uint8_t snapshot_siz = (bytes_per_pixel == 4U) ? 3U : 2U;
+    store_android_vi_snapshot(phys, width, snapshot_height, snapshot_siz, origin_offset);
+
+    if (should_log_android_render_event(vi_swap_log_count)) {
+        if (has_boot_state) {
+            BANJO_ANDROID_RENDER_LOG(
+                "osViSwapBuffer framebuffer=0x%08" PRIX32 " phys=0x%08" PRIX32 " width=%" PRIu32 " bpp=%" PRIu32
+                " meanByte=%" PRIu32 " nonzero=%" PRIu32 "/%" PRIu32
+                " state=%" PRIu32 " gameMode=%" PRIu32 " framebuf=%" PRIu32 "x%" PRIu32
+                " bootMap=%" PRIu32 " level=%u mapState=%" PRIu32 " currentMap=%" PRIu32 " currentExit=%" PRIu32 " loop=%" PRIu32
+                " gameTransition=%u map=%u exit=%u reset=%u pendingMode=%u/%u freeze=%" PRIu32
+                " gcState=%u gcCounter=%" PRIu32 " gcTimer=%.3f gcBlocks=%u",
+                uint32_t(frameBufPtr), phys, width, bytes_per_pixel, sample.mean_byte, sample.nonzero_samples, sample.total_samples,
+                boot_state.main_loop_state, boot_state.game_mode, boot_state.framebuffer_width, boot_state.framebuffer_height,
+                boot_state.boot_map, uint32_t(boot_state.current_level), boot_state.current_map_state, boot_state.current_map, boot_state.current_exit, boot_state.game_loop_counter,
+                uint32_t(boot_state.transition), uint32_t(boot_state.map), uint32_t(boot_state.exit), uint32_t(boot_state.reset_on_load),
+                uint32_t(boot_state.pending_mode), uint32_t(boot_state.pending_mode_arg), boot_state.freeze_scene,
+                uint32_t(boot_state.transition_state), boot_state.transition_counter, boot_state.transition_timer,
+                uint32_t(transition_blocks_render(boot_state)));
+        }
+        else {
+            BANJO_ANDROID_RENDER_LOG(
+                "osViSwapBuffer framebuffer=0x%08" PRIX32 " phys=0x%08" PRIX32 " width=%" PRIu32 " bpp=%" PRIu32 " meanByte=%" PRIu32 " nonzero=%" PRIu32 "/%" PRIu32,
+                uint32_t(frameBufPtr), phys, width, bytes_per_pixel, sample.mean_byte, sample.nonzero_samples, sample.total_samples);
+        }
+    }
+#endif
 }
 
 extern "C" void osViSetMode(RDRAM_ARG PTR(OSViMode) mode_) {
@@ -524,6 +898,11 @@ extern "C" void osViBlack(uint8_t active) {
     } else {
         *state_out &= ~VI_STATE_BLACK;
     }
+#ifdef __ANDROID__
+    if (should_log_android_render_event(vi_black_log_count)) {
+        BANJO_ANDROID_RENDER_LOG("osViBlack active=%u state=0x%08" PRIX32, uint32_t(active), *state_out);
+    }
+#endif
 }
 
 extern "C" void osViRepeatLine(uint8_t active) {

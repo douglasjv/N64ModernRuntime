@@ -48,7 +48,7 @@ void ultramodern::renderer::set_graphics_config(const GraphicsConfig& config) {
     ultramodern::trigger_config_action();
 }
 
-const ultramodern::renderer::GraphicsConfig& ultramodern::renderer::get_graphics_config() {
+ultramodern::renderer::GraphicsConfig ultramodern::renderer::get_graphics_config() {
     std::lock_guard<std::mutex> lock(graphic_config_mutex);
     return graphic_config;
 }

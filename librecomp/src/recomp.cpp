@@ -25,6 +25,13 @@
 #include "librecomp/mods.hpp"
 #include "recompiler/live_recompiler.h"
 
+#if defined(__ANDROID__) && defined(BANJO_ENABLE_ANDROID_TRACE_LOGS)
+#include <android/log.h>
+#define BANJO_ANDROID_GAME_LOG(...) __android_log_print(ANDROID_LOG_INFO, "BanjoInput", __VA_ARGS__)
+#else
+#define BANJO_ANDROID_GAME_LOG(...) ((void)0)
+#endif
+
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
 #    include <Windows.h>
@@ -537,6 +544,13 @@ std::string recomp::current_mod_game_id() {
 
 void recomp::start_game(const std::u8string& game_id, const std::string& game_mode_id) {
     std::lock_guard<std::mutex> lock(current_game_mutex);
+    if (game_status.load() == GameStatus::Running) {
+        BANJO_ANDROID_GAME_LOG("start_game ignored while already running game=%s mode=%s",
+            reinterpret_cast<const char*>(game_id.c_str()), game_mode_id.c_str());
+        return;
+    }
+    BANJO_ANDROID_GAME_LOG("start_game requested game=%s mode=%s",
+        reinterpret_cast<const char*>(game_id.c_str()), game_mode_id.c_str());
     current_game_mode_id = game_mode_id;
     current_game = game_id;
     game_status.store(GameStatus::Running);
@@ -707,14 +721,19 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
             {
                 if (!recomp::load_stored_rom(current_game.value())) {
                     ultramodern::error_handling::message_box("Error opening stored ROM! Please restart this program.");
+                } else {
+                    BANJO_ANDROID_GAME_LOG("load_stored_rom ok size=%zu", recomp::get_rom().size());
                 }
 
                 auto find_it = game_roms.find(current_game.value());
                 const recomp::GameEntry& game_entry = find_it->second;
 
+                BANJO_ANDROID_GAME_LOG("game boot init entrypoint_addr=0x%08" PRIX32, game_entry.entrypoint_address);
                 init(rdram, context, game_entry.entrypoint_address);
                 if (game_entry.on_init_callback) {
+                    BANJO_ANDROID_GAME_LOG("game boot on_init begin");
                     game_entry.on_init_callback(rdram, context);
+                    BANJO_ANDROID_GAME_LOG("game boot on_init end");
                 }
 
                 uint32_t mod_ram_used = 0;
@@ -748,15 +767,19 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                     }
                 }
 
+                BANJO_ANDROID_GAME_LOG("game boot init_heap mod_ram_used=%" PRIu32, mod_ram_used);
                 recomp::init_heap(rdram, recomp::mod_rdram_start + mod_ram_used);
 
                 save_type = game_entry.save_type;
+                BANJO_ANDROID_GAME_LOG("game boot init_saving save_type=%d", int(save_type));
                 ultramodern::init_saving(rdram);
 
                 try {
+                    BANJO_ANDROID_GAME_LOG("game boot entrypoint begin");
                     game_entry.entrypoint(rdram, context);
+                    BANJO_ANDROID_GAME_LOG("game boot entrypoint returned");
                 } catch (ultramodern::thread_terminated& terminated) {
-
+                    BANJO_ANDROID_GAME_LOG("game boot entrypoint terminated");
                 }
             }
             return true;

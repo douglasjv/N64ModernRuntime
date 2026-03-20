@@ -12,6 +12,7 @@ namespace ultramodern {
             Original,
             Original2x,
             Auto,
+            AutoFit,
             OptionCount
         };
         enum class WindowMode {
@@ -82,13 +83,14 @@ namespace ultramodern {
             auto operator<=>(const GraphicsConfig& rhs) const = default;
         };
 
-        const GraphicsConfig& get_graphics_config();
+        GraphicsConfig get_graphics_config();
         void set_graphics_config(const GraphicsConfig& new_config);
 
         NLOHMANN_JSON_SERIALIZE_ENUM(ultramodern::renderer::Resolution, {
             {ultramodern::renderer::Resolution::Original, "Original"},
             {ultramodern::renderer::Resolution::Original2x, "Original2x"},
             {ultramodern::renderer::Resolution::Auto, "Auto"},
+            {ultramodern::renderer::Resolution::AutoFit, "AutoFit"},
         });
 
         NLOHMANN_JSON_SERIALIZE_ENUM(ultramodern::renderer::WindowMode, {
