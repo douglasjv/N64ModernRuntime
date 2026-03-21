@@ -20,11 +20,11 @@
 #include "ultramodern/rsp.hpp"
 #include "ultramodern/renderer_context.hpp"
 
-#if defined(__ANDROID__) && defined(BANJO_ENABLE_ANDROID_TRACE_LOGS)
+#if defined(__ANDROID__) && defined(RECOMP_ENABLE_ANDROID_TRACE_LOGS)
 #include <android/log.h>
-#define BANJO_ANDROID_RENDER_LOG(...) __android_log_print(ANDROID_LOG_INFO, "BanjoRender", __VA_ARGS__)
+#define ULTRAMODERN_ANDROID_RENDER_LOG(...) __android_log_print(ANDROID_LOG_INFO, "UltraRender", __VA_ARGS__)
 #else
-#define BANJO_ANDROID_RENDER_LOG(...) ((void)0)
+#define ULTRAMODERN_ANDROID_RENDER_LOG(...) ((void)0)
 #endif
 
 static ultramodern::events::callbacks_t events_callbacks{};
@@ -348,7 +348,7 @@ void vi_thread_func() {
         if (queue_post_update_screen) {
             events_context.action_queue.enqueue(ScreenUpdateAction{ events_context.vi.regs });
             if (screen_update_order_log_count.fetch_add(1) < 32U) {
-                BANJO_ANDROID_RENDER_LOG("ScreenUpdate queued post-VI prevOrigin=0x%08" PRIX32 " prevWidth=%" PRIu32 " nextOrigin=0x%08" PRIX32 " nextWidth=%" PRIu32,
+                ULTRAMODERN_ANDROID_RENDER_LOG("ScreenUpdate queued post-VI prevOrigin=0x%08" PRIX32 " prevWidth=%" PRIu32 " nextOrigin=0x%08" PRIX32 " nextWidth=%" PRIu32,
                     previous_vi_regs.VI_ORIGIN_REG, previous_vi_regs.VI_WIDTH_REG, next_vi_origin, next_vi_width);
             }
         }
@@ -652,7 +652,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
 #ifdef __ANDROID__
                 const bool log_sp_task = should_log_android_render_event(sp_task_log_count);
                 if (log_sp_task) {
-                    BANJO_ANDROID_RENDER_LOG("SpTask begin dl=0x%08" PRIX32 " ucode=0x%08" PRIX32,
+                    ULTRAMODERN_ANDROID_RENDER_LOG("SpTask begin dl=0x%08" PRIX32 " ucode=0x%08" PRIX32,
                         uint32_t(task_action->task.t.data_ptr), uint32_t(task_action->task.t.ucode));
                 }
 #endif
@@ -663,7 +663,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
 
 #ifdef __ANDROID__
                 if (log_sp_task) {
-                    BANJO_ANDROID_RENDER_LOG("SpTask end dl=0x%08" PRIX32, uint32_t(task_action->task.t.data_ptr));
+                    ULTRAMODERN_ANDROID_RENDER_LOG("SpTask end dl=0x%08" PRIX32, uint32_t(task_action->task.t.data_ptr));
                 }
 #endif
 
@@ -695,9 +695,9 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                     uint32_t type = coalesced_screen_update.regs.VI_STATUS_REG & 0x3U;
                     uint32_t bytes_per_pixel = (type == 3U) ? 4U : 2U;
                     AndroidFramebufferSample sample = sample_android_framebuffer_bytes(origin, width * 240U * bytes_per_pixel);
-                    BANJO_ANDROID_RENDER_LOG("ScreenUpdate begin origin=0x%08" PRIX32 " width=%" PRIu32 " status=0x%08" PRIX32,
+                    ULTRAMODERN_ANDROID_RENDER_LOG("ScreenUpdate begin origin=0x%08" PRIX32 " width=%" PRIu32 " status=0x%08" PRIX32,
                         origin, width, coalesced_screen_update.regs.VI_STATUS_REG);
-                    BANJO_ANDROID_RENDER_LOG("ScreenUpdate sample origin=0x%08" PRIX32 " meanByte=%" PRIu32 " nonzero=%" PRIu32 "/%" PRIu32,
+                    ULTRAMODERN_ANDROID_RENDER_LOG("ScreenUpdate sample origin=0x%08" PRIX32 " meanByte=%" PRIu32 " nonzero=%" PRIu32 "/%" PRIu32,
                         origin, sample.mean_byte, sample.nonzero_samples, sample.total_samples);
                 }
 #endif
@@ -707,7 +707,7 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                 resolution_scale = renderer_context->get_resolution_scale();
 #ifdef __ANDROID__
                 if (log_screen_update) {
-                    BANJO_ANDROID_RENDER_LOG("ScreenUpdate end rate=%" PRIu32 " scale=%.2f",
+                    ULTRAMODERN_ANDROID_RENDER_LOG("ScreenUpdate end rate=%" PRIu32 " scale=%.2f",
                         display_refresh_rate.load(), resolution_scale.load());
                 }
 #endif
@@ -809,7 +809,7 @@ extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
 
     if (should_log_android_render_event(vi_swap_log_count)) {
         if (has_boot_state) {
-            BANJO_ANDROID_RENDER_LOG(
+            ULTRAMODERN_ANDROID_RENDER_LOG(
                 "osViSwapBuffer framebuffer=0x%08" PRIX32 " phys=0x%08" PRIX32 " width=%" PRIu32 " bpp=%" PRIu32
                 " meanByte=%" PRIu32 " nonzero=%" PRIu32 "/%" PRIu32
                 " state=%" PRIu32 " gameMode=%" PRIu32 " framebuf=%" PRIu32 "x%" PRIu32
@@ -825,7 +825,7 @@ extern "C" void osViSwapBuffer(RDRAM_ARG PTR(void) frameBufPtr) {
                 uint32_t(transition_blocks_render(boot_state)));
         }
         else {
-            BANJO_ANDROID_RENDER_LOG(
+            ULTRAMODERN_ANDROID_RENDER_LOG(
                 "osViSwapBuffer framebuffer=0x%08" PRIX32 " phys=0x%08" PRIX32 " width=%" PRIu32 " bpp=%" PRIu32 " meanByte=%" PRIu32 " nonzero=%" PRIu32 "/%" PRIu32,
                 uint32_t(frameBufPtr), phys, width, bytes_per_pixel, sample.mean_byte, sample.nonzero_samples, sample.total_samples);
         }
@@ -900,7 +900,7 @@ extern "C" void osViBlack(uint8_t active) {
     }
 #ifdef __ANDROID__
     if (should_log_android_render_event(vi_black_log_count)) {
-        BANJO_ANDROID_RENDER_LOG("osViBlack active=%u state=0x%08" PRIX32, uint32_t(active), *state_out);
+        ULTRAMODERN_ANDROID_RENDER_LOG("osViBlack active=%u state=0x%08" PRIX32, uint32_t(active), *state_out);
     }
 #endif
 }
